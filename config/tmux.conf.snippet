@@ -1,0 +1,59 @@
+# >>> smart-compact tmux >>>
+# Minimum tmux config for Claude Code self-compaction (claude-tmux.sh / ctm).
+# Appended by install.sh when absent. Your own tmux config can carry anything
+# else on top; only this block is required for self-compaction.
+
+# Visual parity: forward the session name as the terminal tab title, keep
+# truecolor, let Claude Code notifications/progress pass through, and enable
+# extended keys so Shift+Enter inserts a newline instead of submitting.
+set -g set-titles on
+set -g set-titles-string "#S"
+set -g default-terminal "tmux-256color"
+set -as terminal-features ",xterm-256color:RGB"
+set -as terminal-features ",xterm-ghostty:RGB"
+set -g allow-passthrough on
+set -s extended-keys on
+set -as terminal-features 'xterm*:extkeys'
+
+# Close-out lifecycle: server dies with its last session; panes die with their
+# program. destroy-unattached is deliberately NOT set here — claude-tmux.sh
+# sets it per session (ephemeral on; named ctm sessions off); server-wide it
+# would kill detached-created sessions at birth.
+set -s  exit-empty on
+setw -g remain-on-exit off
+set -s  set-clipboard on
+
+# Claude session-identity scrub at SERVER BIRTH. A tmux server first started
+# from inside a Claude session freezes that session's identity env into the
+# tmux global environment; every wrapped launch then boots believing it is a
+# nested child of a dead session (degraded harness, wrong context ceiling).
+set-environment -gu CLAUDECODE
+set-environment -gu CLAUDE_CODE_CHILD_SESSION
+set-environment -gu CLAUDE_CODE_SESSION_ID
+set-environment -gu CLAUDE_CODE_ENTRYPOINT
+set-environment -gu CLAUDE_CODE_EXECPATH
+set-environment -gu CLAUDE_CODE_VERSION
+set-environment -gu CLAUDE_CODE_MAX_CONTEXT_TOKENS
+set-environment -gu CLAUDE_CODE_BRIDGE_SESSION_ID
+set-environment -gu CLAUDE_EFFORT
+set-environment -gu CLAUDE_JOB_DIR
+set-environment -gu CLAUDE_PLUGIN_DATA
+set-environment -gu CODEX_COMPANION_SESSION_ID
+set-environment -gu CODEX_COMPANION_TRANSCRIPT_PATH
+set-environment -gu AI_AGENT
+set-environment -gu TRACEPARENT
+set-environment -gu GIT_EDITOR
+# Settings-mirror vars (claude re-derives these from settings.json at every
+# launch; a frozen copy in tmux global env would go stale on the next retune).
+set-environment -gu CLAUDE_CODE_AUTO_COMPACT_WINDOW
+set-environment -gu CLAUDE_CODE_DAEMON_COLD_START
+set-environment -gu CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF
+set-environment -gu CLAUDE_CODE_STOP_HOOK_BLOCK_CAP
+# Dynamic backstop: any CLAUDE_CODE_*/CODEX_COMPANION_* var a FUTURE Claude
+# Code update stamps into the global env is discovered and scrubbed at server
+# birth, so the protection survives updates without editing this file.
+# #{socket_path}: the helper must target THIS server explicitly — on isolated
+# per-launch `-S` sockets a plain `tmux` call would resolve to the default
+# socket (wrong server; the backstop would be a silent no-op there).
+if-shell "test -x ~/.claude/scripts/tmux-global-env-scrub.sh" "run-shell -b '~/.claude/scripts/tmux-global-env-scrub.sh #{socket_path}'"
+# <<< smart-compact tmux <<<

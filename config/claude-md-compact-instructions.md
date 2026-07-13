@@ -1,0 +1,3 @@
+# Compact instructions
+
+When compacting (manual or auto): PRESERVE the active task/goal + acceptance criteria; exact file paths, symbol names, branch/PR numbers touched; unresolved errors + failing test output verbatim; user corrections/decisions this session; and any memory-tool IDs written. DROP resolved tangents, verbose tool output already acted on, and superseded plans. Keep facts that would be expensive to re-derive. If a session ledger path (`.claude/blackboard/<session>/LEDGER.md`) appears in the conversation, preserve that exact path in the summary and defer to the ledger for active-task state — it is re-injected verbatim after compaction.

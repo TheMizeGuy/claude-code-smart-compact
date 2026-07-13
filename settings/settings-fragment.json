@@ -1,0 +1,63 @@
+{
+  "//": "Merge these entries into ~/.claude/settings.json. Replace $HOME with the absolute home path — Claude Code does not expand ~ or $HOME in hook commands. install.sh applies this merge automatically and idempotently, substituting your --window value for the context-window env entry (default 200000).",
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/context-watermark.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/context-watermark.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/precompact-recorder.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/compact-rehydrate.py",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/compact-rehydrate.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}
