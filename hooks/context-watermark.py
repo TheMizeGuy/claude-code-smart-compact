@@ -4,7 +4,7 @@
 Computes true context-window occupancy from the transcript (latest assistant
 message.usage) and injects a
 one-shot additionalContext nudge as the session crosses 75% / 87% / 94% of the
-EFFECTIVE auto-compact ceiling — the median of recently OBSERVED auto-compact
+EFFECTIVE auto-compact ceiling — the MAX of recently OBSERVED auto-compact
 occupancies from the flight recorder, not the nominal
 CLAUDE_CODE_AUTO_COMPACT_WINDOW (the harness fires well below it; see
 effective_ceiling). The nudges drive the smart-compact protocol: externalize
@@ -46,7 +46,8 @@ LEDGER_TEMPLATE = """# SESSION LEDGER (update the timestamp on every write)
 def latest_usage_tokens(path):
     """Bounded 256KB reverse-scan for the latest assistant usage sum.
 
-    Kept in sync with the copy in precompact-recorder.py. Skips isSidechain entries: current builds keep subagent
+    Kept in sync with the copy in precompact-recorder.py. Skips isSidechain
+    entries: current builds keep subagent
     turns in separate transcript files, but older formats inlined them with
     isSidechain: true — their usage reflects the subagent's window, not ours.
     """
@@ -112,18 +113,28 @@ EVENTS_LOG = os.environ.get("COMPACT_EVENTS_LOG") or os.path.expanduser(
 
 
 def effective_ceiling(window):
-    """Estimate where auto-compact ACTUALLY fires: median of the last 5 genuine
+    """Estimate where auto-compact ACTUALLY fires: MAX of the last 5 genuine
     auto occupancies from the flight recorder, clamped to [50%, 100%] of the
     nominal window.
 
     The harness's real trigger point sits below CLAUDE_CODE_AUTO_COMPACT_WINDOW
-    and moves across builds (observed clusters ~533K and ~613K against 650K).
-    Tiers computed against the nominal window sat ABOVE the real point, so
-    T2/T3 never fired and 13/20 compactions landed with no ledger (2026-07-08
-    flight data). Learning the ceiling from the recorder's own log
-    self-corrects across harness updates. Fewer than 2 samples (fresh install,
-    rotated-away log): assume 85% of nominal — mildly-early nudges beat dead
-    ones.
+    and moves across builds (observed clusters ~533K and ~615-618K against
+    650K). Tiers computed against the nominal window sat ABOVE the real point,
+    so T2/T3 never fired and 13/20 compactions landed with no ledger
+    (2026-07-08 flight data). Learning the ceiling from the recorder's own log
+    self-corrects across harness updates.
+
+    Max, not median (2026-07-17): a recorded occupancy is the LAST assistant
+    usage before the compaction — everything appended after it (the very
+    growth that tripped auto-compact, e.g. a huge mid-turn tool result) is
+    invisible, so samples only ever UNDERSTATE the true trigger and max stays
+    a safe lower bound. Live data: lag artifacts 395-492K amid a true ~616K
+    trigger put the median at 492,578 — T3 fired ~123K early and sessions
+    self-compacted at 437-450K, wasting ~170K of usable window per cycle.
+    Cost of max: a build regression that LOWERS the trigger takes up to 5
+    samples to re-learn (T1 + the recorder's auto-ledger floor cover the
+    transition). Fewer than 2 samples (fresh install, rotated-away log):
+    assume 85% of nominal — mildly-early nudges beat dead ones.
     """
     samples = []
     try:
@@ -157,8 +168,7 @@ def effective_ceiling(window):
         # 1000-token floor: a typo'd tiny window would otherwise yield
         # ceiling 0 and a silently-swallowed ZeroDivisionError on every call.
         return max(int(window * 0.85), 1000)
-    samples.sort()
-    return max(int(window * 0.5), min(samples[len(samples) // 2], window), 1000)
+    return max(int(window * 0.5), min(max(samples), window), 1000)
 
 
 def self_compact_line(transcript):

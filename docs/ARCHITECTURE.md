@@ -30,11 +30,18 @@ a deterministic auto-ledger floor for the compactions no nudge can cover.
 
 - Occupancy via a bounded 256KB reverse-scan of the transcript; window W =
   `CLAUDE_CODE_AUTO_COMPACT_WINDOW` → settings.json fallback → 1M.
-- **Effective ceiling**: C = median of the last 5 genuine auto-compact
+- **Effective ceiling**: C = MAX of the last 5 genuine auto-compact
   occupancies from the flight log (`COMPACT_EVENTS_LOG`; manual/agent/`event`
   lines ignored), clamped to [0.5W, W]; fewer than 2 samples → 0.85W fallback.
-  Self-corrects across Claude Code updates that move the real trigger point.
-  **Tiers apply to C, not W.**
+  Max, not median: a recorded occupancy is the LAST assistant usage before the
+  compaction, so growth appended after it (a huge mid-turn tool result) is
+  invisible — samples only ever UNDERSTATE the true trigger, and a median
+  dragged down by such lag artifacts fires the tiers far too early (observed
+  live: T3 firing ~123K tokens before the real trigger). Max stays a safe
+  lower bound; the cost is that a build change which LOWERS the real trigger
+  takes up to 5 samples to re-learn (T1 plus the auto-ledger floor cover the
+  transition). Self-corrects across Claude Code updates that move the real
+  trigger point. **Tiers apply to C, not W.**
 - One-shot nudges (sentinel files under the state root, keyed by transcript
   hash):
   - **T1 at 75% of C**: start externalizing; create/refresh the ledger at the
@@ -64,9 +71,11 @@ a deterministic auto-ledger floor for the compactions no nudge can cover.
 
 ### precompact-recorder.py (PreCompact, manual + auto)
 
-Flight recorder: appends `{ts, session_id, trigger, occupancy, ledger_present,
-agent}` to the events log (1MB rotation); snapshots the ledger (keeps 3);
-stamps `compacted` for the watermark.
+Flight recorder: appends `{ts, session_id, trigger, occupancy, model,
+ledger_present, agent}` to the events log (1MB rotation; `model` is read from
+the same assistant entry as the occupancy, so per-model trigger regimes are
+diagnosable); snapshots the ledger (keeps 3); stamps `compacted` for the
+watermark.
 
 **Auto-ledger**: when the model ledger is missing or >20 min old, writes
 `LEDGER.auto.md` (≤6KB), a deterministic extraction from the transcript tail:
@@ -139,12 +148,34 @@ Guards, each of which exists because the naive version failed in practice:
   underscores on some builds), re-verified before every send.
 - Turn-end detection uses transcript quiescence AND the pane busy indicator
   (mtime alone misfires on long tool calls); the busy check includes 'esc to
-  interrupt', a line-leading compacting spinner checked only in the last 6
+  interrupt' plus the per-state `(esc to …)` hint variants newer TUIs render
+  instead, a running timer status line matched by SHAPE (ellipsis +
+  parenthesized elapsed counter — newer builds carry no esc-hint on that
+  line, while past-tense idle summaries stay unmatched), the 'press up to
+  edit queued messages' hint (input already queued — never stack `/compact`
+  behind it), a line-leading compacting spinner checked only in the last 6
   pane lines (so scrollback prose can't wedge the watcher), and open
   permission dialogs.
+- **Queued sends**: a `/compact` that still lands mid-turn (pane-render false
+  negatives race turn starts) does NOT execute — the TUI logs a
+  queue-operation enqueue entry and holds the text until the REAL turn end,
+  which a blocking Stop hook (e.g. an active goal loop) can push out for
+  hours. The watcher detects the unescaped enqueue entry (an
+  order-independent pair match, so task-notification enqueues and escaped
+  mentions never count) and upgrades its boundary wait from 30 min to
+  `QUEUED_TIMEOUT` (4h default) — queued means armed, not lost. With NO
+  evidence at all (no boundary, no failure entry, no enqueue) it sends one
+  bare Enter after `FLUSH_AFTER` seconds: a swallowed submit-Enter leaves the
+  command sitting unsubmitted in the input box, and on an empty input the
+  flush is a no-op. If the wait still expires, the abort notice states the
+  `/compact` is STILL ARMED in the pane and how to recall it.
 - **Adoption**: an EXTERNAL compaction (auto or user-typed) landing between
   scheduling and send is detected via a size-at-schedule boundary check and
-  ADOPTED: `/compact` is skipped, only the continuation is sent.
+  ADOPTED: `/compact` is skipped, only the continuation is sent. A boundary
+  adopted MID-TURN skips the continuation too: the watcher gives a busy pane
+  up to 120s to go idle after the boundary, and an actively-working session
+  needs no wake-up (a continuation typed into it would only enqueue and fire
+  stale at the eventual turn end).
 - Every transcript byte-count read is failure-guarded (an empty `wc -c` would
   make the scan rescan the whole file and match a HISTORICAL boundary).
 - Boundary detection greps the unescaped `"subtype":"compact_boundary"`
@@ -174,8 +205,10 @@ still-future reset means NOT idle, so the watcher never types into a stalled
 TUI; a TIMELESS banner (credit-exhaustion shapes) aborts instead of queueing
 a latent `/compact`. Timers: the boundary timeout defaults to 1800s because a
 typed `/compact` QUEUES until the real turn end and Stop hooks legitimately
-extend turns past 10 minutes; the recorder's verifier keeps its own 600s
-because it counts from PreCompact (execution), not from the keystroke.
+extend turns past 10 minutes; a DETECTED enqueue upgrades the wait to
+`QUEUED_TIMEOUT` (see Queued sends above); the recorder's verifier keeps its
+own 600s because it counts from PreCompact (execution), not from the
+keystroke.
 
 ### The launcher (claude-tmux.sh / `ctm`)
 
@@ -209,7 +242,7 @@ periodic cadence.
 
 ## Verification
 
-The shipped state passed 189 regression checks across four suites (see
+The shipped state passed 215 regression checks across four suites (see
 SETUP.md §3), an end-to-end run of the real self-compact script against a
 stub tmux (schedule → /compact → limit failure → reset retry → boundary →
 continuation), live self-compactions on real sessions, and multiple
@@ -234,6 +267,8 @@ regression test now asserts the healthy case proceeds.
 - The nudge→ledger step depends on model compliance; the ledger-status line,
   the compact instructions, and the recovery protocol are the layered
   mitigations, and the deterministic auto-ledger removes the total-loss case.
-- The effective ceiling is an estimate learned from ≤5 samples; per-session
-  variance is absorbed by the clamp band, and estimator failure degrades to
-  the 0.85W fallback, never to silence.
+- The effective ceiling is an estimate learned from ≤5 samples (max-based,
+  since recorded occupancies only ever understate the trigger); a build
+  change that LOWERS the real trigger is re-learned within 5 samples,
+  per-session variance is absorbed by the clamp band, and estimator failure
+  degrades to the 0.85W fallback, never to silence.

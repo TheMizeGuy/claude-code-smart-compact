@@ -46,6 +46,27 @@ PANE_CONTENT="  2. Yes, and don't ask again";             pane_busy && ok "don't
 PANE_CONTENT="  3. No, and tell Claude what to do differently"; pane_busy && ok "no-and-tell busy" || bad "no-and-tell"
 PANE_CONTENT="> ";                                        pane_busy && bad "idle prompt busy" || ok "idle prompt not busy"
 PANE_CONTENT="? for shortcuts     tokens: 0";             pane_busy && bad "shortcuts line busy" || ok "shortcuts not busy"
+# 2026-07-17 live-caught renders: the 2.1.20x TUI renders
+# per-state esc-hints and a timer status line WITHOUT 'esc to interrupt'. All
+# of the busy ones below were on screen while a /goal turn was ACTIVE — the old
+# pane_busy said idle and the typed /compact ENQUEUED into queued messages,
+# where it sat (a blocked Stop does NOT flush the queue) until hand-recalled.
+PANE_CONTENT="     Waiting for task (esc to give additional instructions)"
+pane_busy && ok "task-wait esc-variant busy" || bad "task-wait esc-variant missed"
+PANE_CONTENT="✢ Wibbling… (1h 17m 43s · ↓ 162.0k tokens)"
+pane_busy && ok "running timer status line busy" || bad "running timer status missed"
+PANE_CONTENT="✻ Hatching… (3s)"
+pane_busy && ok "short timer status line busy" || bad "short timer status missed"
+PANE_CONTENT="✻ Baking… (esc to interrupt)"
+pane_busy && ok "legacy spinner esc-hint still busy" || bad "legacy spinner regressed"
+PANE_CONTENT="❯ Press up to edit queued messages"
+pane_busy && ok "queued-messages hint busy (input already queued)" || bad "queued-messages hint missed"
+PANE_CONTENT="✻ Brewed for 49s · 1 monitor still running"
+pane_busy && bad "idle past-tense summary (monitor) false-positive" || ok "idle summary w/ background monitor not busy"
+PANE_CONTENT="✻ Crunched for 1m 24s · 1 shell still running"
+pane_busy && bad "idle past-tense summary (shell) false-positive" || ok "idle summary w/ background shell not busy"
+PANE_CONTENT="  ◯ release  Autonomous release pipeline    9/10 agents done · 46m 10s · ↓ 1.1m tokens"
+pane_busy && bad "agent-status footer false-positive" || ok "agent-status footer not busy"
 
 echo "== B) send_line: Enter ONLY when pane is claude before AND after typing =="
 VERDICTS="yy"; TMUXLOG=""; send_line "hello" "t"; rc=$?
@@ -140,7 +161,7 @@ else
     && [ "$ep" -le "$now" ] && ok "just-elapsed reset kept in the past (retry-now signal)" || bad "recent-past reset (got ep=${ep:-none})"
   parse_reset_epoch "You've hit your session limit · resets $(lc_time -v-3H) ($TZP)" >/dev/null \
     && bad "3h-stale banner accepted (wrong-day parse must be rejected)" || ok "stale banner rejected (> LIMIT_WAIT_MAX ahead)"
-  parse_reset_epoch "You've reached your Opus limit. Run /usage-credits to continue or switch models with /model." >/dev/null \
+  parse_reset_epoch "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model." >/dev/null \
     && bad "time-less model-limit banner accepted" || ok "time-less banner rejected"
   nomin=$(TZ="$TZP" date -v+3H '+%l%p' | tr -d ' ' | tr 'APM' 'apm')
   ep=$(parse_reset_epoch "resets $nomin ($TZP)") \
@@ -173,7 +194,7 @@ else
     && ok "future-reset banner detected as limit-paused" || bad "future-reset banner missed"
   PANE_CONTENT="  ⎿  You've hit your session limit · resets $(lc_time -v-3H) ($TZP)"
   pane_limit_paused && bad "stale banner (reset long past) treated as paused" || ok "stale banner not paused"
-  PANE_CONTENT="⏺ You've reached your Opus limit. Run /usage-credits to continue."
+  PANE_CONTENT="⏺ You've reached your Fable 5 limit. Run /usage-credits to continue."
   pane_limit_paused && bad "time-less banner treated as paused (would wait forever)" || ok "time-less banner not paused"
   [ "$LIMIT_BANNER_KIND" = "timeless" ] && ok "time-less banner flagged 'timeless' (abort signal for the caller)" || bad "timeless kind not set (got '${LIMIT_BANNER_KIND:-}')"
   PANE_CONTENT="> "
@@ -194,7 +215,7 @@ else
   now0=$(date +%s); deadline=$(( now0 + 60 )); limit_cap=$(( now0 + 21600 ))
   PANE_CONTENT="> "
   wait_turn_end; [ $? -eq 0 ] && ok "quiescent idle prompt -> rc0 (safe to send)" || bad "idle prompt gate"
-  PANE_CONTENT="⏺ You've reached your Opus limit. Run /usage-credits to continue."
+  PANE_CONTENT="⏺ You've reached your Fable 5 limit. Run /usage-credits to continue."
   wait_turn_end; [ $? -eq 3 ] && ok "timeless limit banner -> rc3 (abort, never send)" || bad "timeless banner gate"
   PANE_CONTENT="esc to interrupt"; deadline=$(( $(date +%s) - 1 ))
   wait_turn_end; [ $? -eq 1 ] && ok "busy past deadline -> rc1 (turn never ended)" || bad "deadline gate"
@@ -217,6 +238,27 @@ else
   printf '{"type":"user","content":"quoting \\"subtype\\":\\"local_command\\" plus Error during compaction prose"}\n' \
     | grep -Eq "$E_RE_VAL" && bad "escaped mention matched E_RE" || ok "escaped mention rejected by E_RE"
   printf '%s\n' '{"type":"system","subtype":"compact_boundary"}' | grep -Eq "$E_RE_VAL" && bad "boundary entry matched E_RE" || ok "boundary entry not matched by E_RE"
+fi
+
+echo "== I2) Q_RE: queued-send (enqueue) detection =="
+# 2026-07-17 (live-caught): a /compact typed into a mid-turn pane doesn't
+# execute — the TUI logs {"type":"queue-operation","operation":"enqueue",
+# "content":"/compact …"} and the message sits in queued messages until the
+# REAL turn end (a Stop blocked by /goal does NOT flush it). The watcher must
+# recognize that entry: it means "queued, not lost" — hold for the turn end
+# instead of timing out at COMPACT_TIMEOUT and orphaning an armed /compact.
+Q1=$(sed -n "s/^Q_RE1='\(.*\)'\$/\1/p" "$SRC"); Q2=$(sed -n "s/^Q_RE2='\(.*\)'\$/\1/p" "$SRC")
+if [ -z "$Q1" ] || [ -z "$Q2" ]; then
+  bad "Q_RE1/Q_RE2 not defined in $SRC"
+else
+  REAL_ENQ='{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-17T07:35:36.147Z","sessionId":"019f4200-0000-4000-8000-0000000000e1","content":"/compact PR review gate -> test run -> merge -> version bump -> release"}'
+  printf '%s\n' "$REAL_ENQ" | grep -E "$Q1" | grep -Eq "$Q2" && ok "real /compact enqueue entry detected" || bad "real enqueue entry missed"
+  TASK_ENQ='{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-17T06:41:07.483Z","sessionId":"019f4200-0000-4000-8000-0000000000e1","content":"<task-notification>Agent finished</task-notification>"}'
+  printf '%s\n' "$TASK_ENQ" | grep -E "$Q1" | grep -Eq "$Q2" && bad "task-notification enqueue misread as our /compact" || ok "task-notification enqueue ignored"
+  DEQ='{"type":"queue-operation","operation":"dequeue","content":"/compact x"}'
+  printf '%s\n' "$DEQ" | grep -E "$Q1" | grep -Eq "$Q2" && bad "non-enqueue queue op matched" || ok "non-enqueue queue op ignored"
+  QUOTED='{"type":"user","content":"result quoting \"type\":\"queue-operation\" and \"operation\":\"enqueue\" and \"content\":\"/compact x\" inside a string"}'
+  printf '%s\n' "$QUOTED" | grep -E "$Q1" | grep -Eq "$Q2" && bad "escaped mention matched Q_REs" || ok "escaped mention rejected"
 fi
 
 echo "== J) clear_watermark_state: failed compaction re-arms the nudge pipeline =="
@@ -246,6 +288,16 @@ grep -q '^wait_for_reset() {' "$SRC" && ok "wait_for_reset helper present" || ba
 grep -q 'pane_limit_paused' "$SRC" && [ "$(grep -c 'pane_limit_paused' "$SRC")" -ge 2 ] && ok "phase-1 consults pane_limit_paused" || bad "pane_limit_paused not consulted"
 [ "$(grep -Ec '^[[:space:]]+wait_turn_end( |$)' "$SRC")" -ge 2 ] && ok "wait_turn_end gates BOTH phase-1 and the post-reset retry" || bad "retry send not re-gated by wait_turn_end"
 grep -q 'PANE_PID0=' "$SRC" && ok "pane root-PID identity anchor captured at schedule" || bad "PANE_PID0 capture missing"
+
+echo "== L) queued-send handling structural drift guards (2026-07-17) =="
+grep -q '^QUEUED_TIMEOUT=' "$SRC" && ok "QUEUED_TIMEOUT knob present" || bad "QUEUED_TIMEOUT missing"
+grep -qi 'press up to edit queued messages' "$SRC" && ok "queued-input busy tell present in pane_busy" || bad "queued-messages busy tell missing"
+grep -qF '\(esc to [a-z]' "$SRC" && ok "per-state esc-hint variant covered by pane_busy" || bad "esc-variant pattern missing"
+grep -qF '[0-9]+[hms]' "$SRC" && ok "timer status-line busy shape present in pane_busy" || bad "timer-shape pattern missing"
+grep -q 'ENQUEUED mid-turn' "$SRC" && ok "post-send enqueue detection wired into the boundary wait" || bad "enqueue detection missing"
+grep -q 'flush Enter' "$SRC" && ok "swallowed-Enter flush recovery present" || bad "flush recovery missing"
+grep -q 'continuation SKIPPED' "$SRC" && ok "phase-4 mid-turn skip gate present" || bad "phase-4 busy gate missing"
+grep -q '^notify_note() {' "$SRC" && ok "notify_note visibility helper present" || bad "notify_note missing"
 
 echo "---- $P passed, $F failed"
 exit $F

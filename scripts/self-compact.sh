@@ -31,9 +31,17 @@
 # watcher per pane (lock); every phase timeboxed; logs to
 # ~/.claude/logs/self-compact.log. The continuation prompt is the safety net —
 # without it a self-compacted session would sit idle waiting for input.
-# Known interplay: an active /goal Stop hook that keeps blocking the stop delays
+# Known interaction: an active /goal Stop hook that keeps blocking the stop delays
 # turn-end; if the turn runs past IDLE_TIMEOUT (15 min) the watcher aborts
-# silently and no compact happens — re-schedule at the next boundary.
+# (notified) and no compact happens — re-schedule at the next boundary.
+# Queued-send handling (2026-07-17): a /compact that lands mid-turn does NOT
+# execute — the TUI enqueues it (queue-operation transcript entry) and flushes
+# it only at the REAL turn end; a Stop blocked by /goal does not flush it.
+# Phase 3 detects the enqueue and holds QUEUED_TIMEOUT (4h default) for the
+# turn end instead of timing out blind at 30 min; with zero evidence at all it
+# sends one bare Enter after FLUSH_AFTER (swallowed-Enter recovery). Phase 4
+# skips the continuation when the boundary was adopted mid-turn (an active
+# session needs no wake-up).
 # Usage-limit awareness (2026-07-09): /compact is a MODEL call and fails
 # outright at usage-limit exhaustion. Phase 1 refuses to type into a
 # limit-paused pane (banner with a future reset) and waits the reset out;
@@ -53,9 +61,16 @@ IDLE_TIMEOUT="${SELF_COMPACT_IDLE_TIMEOUT:-900}"    # give up waiting for turn e
 # past 10 minutes — a 600s timeout lost the continuation on a compaction that
 # then SUCCEEDED (observed live 2026-07-09: queued 10m36s, boundary at +13m).
 # Failure cases don't need this timeout anymore (E_RE fail-fasts them;
-# the shrink guard catches rotation; pane/PID guards catch replacement), so
-# its only remaining job is the queued-behind-work case — where waiting wins.
+# the shrink guard catches rotation; pane/PID guards catch replacement).
+# A DETECTED queue (enqueue entry in the transcript) upgrades the wait to
+# QUEUED_TIMEOUT: queued messages flush only at the real turn end, a Stop
+# blocked by /goal does NOT flush them (verified live 2026-07-17: a /compact
+# sat queued 10+ min into a 1h+ goal turn), and /goal
+# turns legitimately run hours. COMPACT_TIMEOUT keeps covering the
+# no-evidence case only.
 COMPACT_TIMEOUT="${SELF_COMPACT_TIMEOUT:-1800}"     # give up waiting for the boundary after 30 min
+QUEUED_TIMEOUT="${SELF_COMPACT_QUEUED_TIMEOUT:-14400}"  # boundary wait once the send is KNOWN queued (4h)
+FLUSH_AFTER="${SELF_COMPACT_FLUSH_AFTER:-30}"       # zero evidence this long after the send -> one bare-Enter flush
 LIMIT_RETRIES="${SELF_COMPACT_LIMIT_RETRIES:-1}"    # /compact re-sends after a usage-limit reset
 LIMIT_GRACE="${SELF_COMPACT_LIMIT_GRACE:-180}"      # seconds past the stated reset before acting
 LIMIT_WAIT_MAX="${SELF_COMPACT_LIMIT_WAIT_MAX:-21600}"  # never wait out a reset farther than this (6h)
@@ -103,26 +118,41 @@ pane_is_claude() {
   tmux display-message -p -t "$PANE" '#{pane_current_command}' 2>/dev/null \
     | grep -Eq '^(claude|node|[0-9]+[._][0-9]+[._][0-9]+)$'
 }
-# True while the pane is NOT safely idle-at-prompt — a turn is actively running
-# ('esc to interrupt'), a compaction is in flight (a line-leading 'Compacting…'
-# spinner: transcript goes quiet and there may be no esc-hint, so without this
-# the watcher reads mid-compaction as turn-end and types /compact into it,
-# queuing a SECOND compaction — raced live 2026-07-08 05:30), OR a permission/
-# confirmation dialog is open and waiting on the user. The dialog case is the
-# real hazard: typing /compact + Enter INTO an open dialog can auto-approve an
-# unreviewed tool call. 'compacting' is line-start-anchored (modulo spinner
-# glyphs) so prose MENTIONING compaction doesn't pin the watcher. False
-# positives here only DELAY compaction (safe direction); the false negatives
-# are what we defend against.
+# True while the pane is NOT safely idle-at-prompt — a turn is actively running,
+# a compaction is in flight (a line-leading 'Compacting…' spinner: transcript
+# goes quiet and there may be no esc-hint, so without this the watcher reads
+# mid-compaction as turn-end and types /compact into it, queuing a SECOND
+# compaction — raced live 2026-07-08 05:30), OR a permission/confirmation
+# dialog is open and waiting on the user. The dialog case is the real hazard:
+# typing /compact + Enter INTO an open dialog can auto-approve an unreviewed
+# tool call. False positives here only DELAY compaction (safe direction); the
+# false negatives are what we defend against.
 pane_busy() {
   local cap
   cap=$(tmux capture-pane -p -t "$PANE" 2>/dev/null)
+  # Dialog / esc-hint / queued-input tells. 'esc to interrupt' is the classic
+  # streaming hint; '\(esc to [a-z]' catches the per-state variants newer TUIs
+  # render instead — "Waiting for task (esc to give additional instructions)"
+  # was on screen 2026-07-17 while a /goal turn was ACTIVE,
+  # this function said idle, and the typed /compact ENQUEUED instead of
+  # executing. 'press up to edit queued messages' = input is already queued
+  # behind a running turn — never stack /compact behind it.
   printf '%s\n' "$cap" | tail -n 18 \
-    | grep -Eqi 'esc to interrupt|do you want to|no, and tell claude|don.t ask again' && return 0
+    | grep -Eqi 'esc to interrupt|\(esc to [a-z]|do you want to|no, and tell claude|don.t ask again|press up to edit queued messages' && return 0
+  # Live-activity status line: "✢ Wibbling… (1h 17m 43s · ↓ 162.0k tokens)" —
+  # ellipsis + parenthesized elapsed counter, matched by SHAPE because the
+  # 2.1.20x TUI carries no esc-hint on this line. Past-tense idle summaries
+  # ("✻ Brewed for 49s · 1 monitor still running") and agent-status footers
+  # ("… 46m 10s · ↓ 1.1m tokens") have no ellipsis-paren pair and stay
+  # unmatched. Prose like "retrying… (30s timeout)" in the visible tail DOES
+  # false-positive — accepted: a false busy only delays.
+  printf '%s\n' "$cap" | tail -n 18 \
+    | grep -Eq '(…|\.\.\.)[[:space:]]*\([0-9]+[hms]' && return 0
   # Compaction spinner: only the LAST 6 lines (a live status line lives at the
   # bottom) so line-leading 'compacting' in older scrollback prose can't wedge
   # the watcher toward IDLE_TIMEOUT; optional 'auto-' prefix covers a plausible
-  # TUI phrasing variant.
+  # TUI phrasing variant. 'compacting' is line-start-anchored (modulo spinner
+  # glyphs) so prose MENTIONING compaction doesn't pin the watcher.
   printf '%s\n' "$cap" | tail -n 6 \
     | grep -Eqi '^[^a-zA-Z0-9]*(auto[- ])?compacting'
 }
@@ -141,6 +171,15 @@ pane_busy() {
 # boundary entry, turning a successful compaction into an abort.
 B_RE='"subtype"[[:space:]]*:[[:space:]]*"compact_boundary"'
 E_RE='"subtype"[[:space:]]*:[[:space:]]*"local_command".*(Error during compaction|Not enough messages to compact)'
+# Q_RE1+Q_RE2 = the typed /compact went into QUEUED MESSAGES instead of
+# executing: the TUI logs {"type":"queue-operation","operation":"enqueue",
+# "content":"/compact …"} the moment a send lands mid-turn. Matched as a PAIR
+# on one line (order-independent, both unescaped) so task-notification
+# enqueues (content "<task-notification>…") and entries merely QUOTING an
+# enqueue (\"-escaped) never match. A queued send is armed, not lost — it
+# fires at the real turn end — so Phase 3 holds QUEUED_TIMEOUT for it.
+Q_RE1='"type"[[:space:]]*:[[:space:]]*"queue-operation".*"operation"[[:space:]]*:[[:space:]]*"enqueue"'
+Q_RE2='"content"[[:space:]]*:[[:space:]]*"/compact'
 
 # Parse "resets 9:50pm (America/New_York)" out of a limit banner / error entry
 # into an epoch. A past time within the last 10 min is a just-elapsed reset and
@@ -321,6 +360,15 @@ notify_fail() {
   fi
   return 0
 }
+# Non-failure operator visibility (queued sends, skipped continuations): same
+# channels as notify_fail without the 'aborted' framing. Never fails the caller.
+notify_note() {
+  tmux display-message -t "$PANE" "self-compact: $1" 2>/dev/null
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title self-compact -message "$1" -group self-compact >/dev/null 2>&1
+  fi
+  return 0
+}
 if ! pane_is_claude; then
   CMD=$(tmux display-message -p -t "$PANE" '#{pane_current_command}' 2>/dev/null)
   echo "self-compact: pane $PANE runs '${CMD:-?}', not a claude TUI — refusing" >&2
@@ -461,6 +509,8 @@ echo "[$(ts)] scheduling: pane=$PANE transcript=$TRANSCRIPT focus='$FOCUS'" >> "
   send_line "/compact $FOCUS" "/compact" || { notify_fail "pane guard stopped the /compact send"; clear_watermark_state; exit 1; }
   echo "[$(ts)] /compact sent (transcript was ${size_before}B)" >> "$LOG"
 
+  QUEUED_SEEN=0
+  FLUSHED=0
   start=$(date +%s)
   while :; do
     touch "$LOCK" 2>/dev/null   # heartbeat
@@ -509,6 +559,32 @@ echo "[$(ts)] scheduling: pane=$PANE transcript=$TRANSCRIPT focus='$FOCUS'" >> "
       clear_watermark_state
       exit 1
     fi
+    # The send may have landed mid-turn and ENQUEUED instead of executing
+    # (pane-render false-negatives race turn starts; live-caught 2026-07-17).
+    # The enqueue entry means armed-not-lost: the /compact fires at the REAL
+    # turn end — which a /goal Stop hook can push out for hours — so switch
+    # this wait to QUEUED_TIMEOUT and hold rather than orphaning it.
+    if [ "$QUEUED_SEEN" -eq 0 ] \
+       && tail -c +$(( size_before + 1 )) "$TRANSCRIPT" 2>/dev/null | grep -E "$Q_RE1" | grep -Eq "$Q_RE2"; then
+      QUEUED_SEEN=1
+      echo "[$(ts)] /compact ENQUEUED mid-turn (queue-operation logged) — holding up to ${QUEUED_TIMEOUT}s for the real turn end" >> "$LOG"
+      notify_note "/compact queued mid-turn — holding for the real turn end"
+    fi
+    # Zero evidence (no boundary, no failure entry, no enqueue) FLUSH_AFTER
+    # seconds after the send: the submit-Enter was likely swallowed by a render
+    # race and the text sits UNSUBMITTED in the input box. One bare Enter
+    # flushes it; on an empty input it is a no-op, and a flush that lands
+    # mid-turn merely enqueues — which the scan above then sees next poll.
+    if [ "$FLUSHED" -eq 0 ] && [ "$QUEUED_SEEN" -eq 0 ] && [ $(( $(date +%s) - start )) -ge "$FLUSH_AFTER" ]; then
+      FLUSHED=1
+      if pane_is_claude \
+         && { [ -z "${PANE_PID0:-}" ] || [ "$(tmux display-message -p -t "$PANE" '#{pane_pid}' 2>/dev/null)" = "$PANE_PID0" ]; } \
+         && ! pane_busy \
+         && tmux capture-pane -p -t "$PANE" 2>/dev/null | tail -n 18 | grep -qF '/compact'; then
+        tmux send-keys -t "$PANE" Enter 2>>"$LOG"
+        echo "[$(ts)] no execution evidence ${FLUSH_AFTER}s after the send, '/compact' still visible in an idle claude pane — flush Enter sent (swallowed-Enter recovery)" >> "$LOG"
+      fi
+    fi
     # A transcript that SHRANK below the pre-/compact size was rotated/truncated
     # (compaction only appends, so this is abnormal): the byte-offset scans
     # above read past EOF forever and would never see the boundary. Abort
@@ -517,7 +593,18 @@ echo "[$(ts)] scheduling: pane=$PANE transcript=$TRANSCRIPT focus='$FOCUS'" >> "
     cur_size=$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -dc '0-9'); [ -z "$cur_size" ] && cur_size="$size_before"
     [ "$cur_size" -lt "$size_before" ] && { echo "[$(ts)] ABORT: transcript shrank (${cur_size}B < ${size_before}B) — rotated/truncated, NOT sending continuation" >> "$LOG"; notify_fail "transcript rotated/truncated — continuation NOT sent"; clear_watermark_state; exit 1; }
     now=$(date +%s)
-    [ $(( now - start )) -gt "$COMPACT_TIMEOUT" ] && { echo "[$(ts)] ABORT: no compact_boundary within ${COMPACT_TIMEOUT}s — NOT sending continuation" >> "$LOG"; notify_fail "no boundary within ${COMPACT_TIMEOUT}s — continuation NOT sent"; clear_watermark_state; exit 1; }
+    tmo="$COMPACT_TIMEOUT"; [ "$QUEUED_SEEN" -eq 1 ] && tmo="$QUEUED_TIMEOUT"
+    if [ $(( now - start )) -gt "$tmo" ]; then
+      if [ "$QUEUED_SEEN" -eq 1 ]; then
+        echo "[$(ts)] ABORT: no compact_boundary within ${tmo}s — the queued /compact is STILL ARMED in that session (recall it: press Up then Ctrl+U in the pane) — NOT sending continuation" >> "$LOG"
+        notify_fail "queued /compact never fired within ${tmo}s — STILL ARMED in the pane (Up then Ctrl+U recalls it)"
+      else
+        echo "[$(ts)] ABORT: no compact_boundary within ${tmo}s — NOT sending continuation" >> "$LOG"
+        notify_fail "no boundary within ${tmo}s — continuation NOT sent"
+      fi
+      clear_watermark_state
+      exit 1
+    fi
     sleep 3
   done
   done
@@ -528,12 +615,26 @@ echo "[$(ts)] scheduling: pane=$PANE transcript=$TRANSCRIPT focus='$FOCUS'" >> "
   # Phase 4: continuation. The 6s pause outlasts the rehydrator hook's 5000ms
   # settings.json budget, so its injected ledger context is in place before
   # the continuation submits — 2s raced it and could resume the model blind
-  # on the one turn the rehydration exists for. If the TUI is briefly still
-  # busy the text lands in the input box and queues; that is fine. If claude
-  # is GONE, abort.
+  # on the one turn the rehydration exists for. If claude is GONE, abort.
   sleep 6
-  send_line "$CONTINUATION" "continuation" || { notify_fail "pane guard stopped the continuation send"; exit 1; }
-  echo "[$(ts)] continuation sent" >> "$LOG"
+  # The boundary may be an ADOPTED external one (auto-compact mid-turn): the
+  # session is then still actively working, and a continuation typed now would
+  # only enqueue and fire — stale — at the eventual turn end. The net exists
+  # to wake an IDLE post-compact session: give a busy pane up to 120s to go
+  # idle (post-compact turns from queued task notifications resolve fast) and
+  # skip the wake-up if it stays mid-turn.
+  p4_deadline=$(( $(date +%s) + 120 ))
+  while pane_busy && [ "$(date +%s)" -lt "$p4_deadline" ]; do
+    touch "$LOCK" 2>/dev/null
+    sleep 3
+  done
+  if pane_busy; then
+    echo "[$(ts)] session still mid-turn 120s after the boundary — continuation SKIPPED (an active session needs no wake-up)" >> "$LOG"
+    notify_note "boundary landed mid-turn — continuation skipped"
+  else
+    send_line "$CONTINUATION" "continuation" || { notify_fail "pane guard stopped the continuation send"; exit 1; }
+    echo "[$(ts)] continuation sent" >> "$LOG"
+  fi
 ) >/dev/null 2>&1 &
 # Record the watcher's real PID so a later invocation's lock check (kill -0) can
 # tell a live-but-suspended watcher from a dead one. The subshell's EXIT trap

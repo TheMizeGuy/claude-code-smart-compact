@@ -1,7 +1,10 @@
 #!/bin/bash
 # Standalone tests for context-watermark.py — synthetic transcripts + events.
-# v2: tiers are relative to the EFFECTIVE ceiling (median of recent observed
-# auto-compact occupancies from the flight log), not the nominal window.
+# v2: tiers are relative to the EFFECTIVE ceiling learned from recent observed
+# auto-compact occupancies in the flight log, not the nominal window.
+# v5 (2026-07-17): the estimator takes the MAX of the last 5 genuine autos —
+# readings only ever UNDERSTATE the true trigger (occupancy = last assistant
+# usage; growth after it is invisible), so median was biased ~123K low.
 # COMPACT_EVENTS_LOG redirects the flight log so tests never pollute the real
 # one (the estimator LEARNS from that log — pollution literally re-tunes it).
 set -u
@@ -12,7 +15,7 @@ export WATERMARK_FORCE=1
 export COMPACT_EVENTS_LOG="$TDIR/events.log"
 PASS=0; FAIL=0
 
-# Fixture flight log: last 5 genuine autos 531..535K (median 533000). Noise
+# Fixture flight log: last 5 genuine autos 531..535K (max 535000). Noise
 # that the estimator MUST ignore: agent compactions, manual compacts,
 # rehydrate-outcome lines, non-JSON garbage, and a 6th-oldest auto (700K)
 # that falls outside the last-5 window.
@@ -34,8 +37,8 @@ with open(sys.argv[1], "w") as f:
         f.write(json.dumps(l) + "\n")
     f.write("garbage not json\n")
 EOF
-# Ceiling C = 533000. Tier trip points: T1 75% = 399750, T2 87% = 463710,
-# T3 94% = 501020. Occupancies used below sit just above each.
+# Ceiling C = 535000. Tier trip points: T1 75% = 401250, T2 87% = 465450,
+# T3 94% = 502900. Occupancies used below sit just above each.
 
 mk_transcript() { # path total_tokens
   python3 - "$1" "$2" <<'EOF'
@@ -73,7 +76,7 @@ check "40% of ceiling silent" EMPTY "$(run_hook "$T1" PostToolUse)"
 mk_transcript "$T1" 406000   # 76% of C
 OUT="$(run_hook "$T1" PostToolUse)"
 check "76% of ceiling fires T1" "WATERMARK 75%" "$OUT"
-check "nudge states the learned ceiling" "expected near ~533,000" "$OUT"
+check "nudge states the learned ceiling" "expected near ~535,000" "$OUT"
 check "nudge states the nominal window" "nominal window 650,000" "$OUT"
 check "76% again silent (one-shot)" EMPTY "$(run_hook "$T1" PostToolUse)"
 
@@ -214,6 +217,33 @@ check "single-sample log still uses fallback (406K silent)" EMPTY "$(COMPACT_EVE
 printf '%s\n%s\n' '{"ts":"x","session_id":"s","trigger":"auto","occupancy":520000}' '{"ts":"x","session_id":"s","trigger":"auto","occupancy":540000}' > "$TDIR/two.log"
 FB4="$TDIR/fb4.jsonl"; mk_transcript "$FB4" 411000   # 76% of 540000, 74.4% of fallback
 check "two-sample log engages estimator (411K fires T1)" "WATERMARK 75%" "$(COMPACT_EVENTS_LOG=$TDIR/two.log run_hook "$FB4" PostToolUse)"
+
+# Estimator bias regression (live 2026-07-17): usage-lag artifacts (huge tool
+# results appended after the last assistant usage) produce spuriously-low auto
+# samples. Median of these real recorded samples was 492578 while the true
+# trigger sat ~616K — T3 fired ~123K early and the fleet self-compacted at
+# 437-450K. MAX of the last 5 must win: ceiling 615930.
+python3 - "$TDIR/lag.log" <<'EOF'
+import json, sys
+samples = [613847, 402519, 615930, 395872, 492578]
+with open(sys.argv[1], "w") as f:
+    for i, occ in enumerate(samples):
+        f.write(json.dumps({"ts": "x", "session_id": f"lag{i}", "trigger": "auto", "occupancy": occ}) + "\n")
+EOF
+LG1="$TDIR/lag1.jsonl"; mk_transcript "$LG1" 470000   # 95% of median, 76% of max
+LOUT="$(COMPACT_EVENTS_LOG=$TDIR/lag.log run_hook "$LG1" PostToolUse)"
+check "lag artifacts: 470K fires T1 (max), not T3 (median)" "WATERMARK 75%" "$LOUT"
+check "lag artifacts: ceiling is the max sample" "expected near ~615,930" "$LOUT"
+LG2="$TDIR/lag2.jsonl"; mk_transcript "$LG2" 590000   # 95.8% of 615930
+check "lag artifacts: 590K fires T3 on max ceiling" "WATERMARK 94%" "$(COMPACT_EVENTS_LOG=$TDIR/lag.log run_hook "$LG2" PostToolUse)"
+
+# Clamp: a sample above the nominal window (window lowered after the sample
+# was recorded, or a mis-tagged entry) must clamp the ceiling to the window.
+printf '%s\n%s\n' '{"ts":"x","session_id":"c1","trigger":"auto","occupancy":700000}' '{"ts":"x","session_id":"c2","trigger":"auto","occupancy":690000}' > "$TDIR/clamp.log"
+CL1="$TDIR/clamp1.jsonl"; mk_transcript "$CL1" 500000   # 76.9% of 650000
+COUT="$(COMPACT_EVENTS_LOG=$TDIR/clamp.log run_hook "$CL1" PostToolUse)"
+check "over-window samples clamp ceiling to window (T1)" "WATERMARK 75%" "$COUT"
+check "clamped ceiling states the window" "expected near ~650,000" "$COUT"
 
 # Degenerate window (typo/misconfig): the 1000-token ceiling floor keeps the
 # hook silent-but-alive instead of ZeroDivision-dead for the whole session.

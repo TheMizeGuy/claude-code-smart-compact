@@ -57,19 +57,22 @@ SYMBOL_EDIT_HINTS = (
 
 
 def latest_usage_tokens(path):
-    # Kept in sync with the copy in context-watermark.py. Skips
-    # isSidechain entries — see the note there.
+    # Returns (usage_sum, model) — model read from the SAME assistant entry
+    # the occupancy came from (None when absent), so flight lines are
+    # per-model attributable. Scan logic kept in sync with the copy in
+    # context-watermark.py, which returns only the sum. Skips isSidechain
+    # entries — see the note there.
     try:
         size = os.path.getsize(path)
     except OSError:
-        return None
+        return None, None
     n = min(size, 262144)
     try:
         with open(path, "rb") as f:
             f.seek(size - n)
             data = f.read(n).decode("utf-8", errors="replace")
     except OSError:
-        return None
+        return None, None
     lines = data.split("\n")
     if size > n:
         lines = lines[1:]
@@ -82,7 +85,7 @@ def latest_usage_tokens(path):
         except ValueError:
             continue
         if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
-            return None
+            return None, None
         if d.get("type") != "assistant" or d.get("isSidechain"):
             continue
         u = d.get("message", {}).get("usage")
@@ -93,8 +96,8 @@ def latest_usage_tokens(path):
             + u.get("output_tokens", 0)
             + u.get("cache_read_input_tokens", 0)
             + u.get("cache_creation_input_tokens", 0)
-        )
-    return None
+        ), d.get("message", {}).get("model")
+    return None, None
 
 
 def _text_of(content):
@@ -345,7 +348,7 @@ def main():
         except OSError:
             pass
 
-    occ = latest_usage_tokens(transcript) if transcript else None
+    occ, model = latest_usage_tokens(transcript) if transcript else (None, None)
 
     # Deterministic floor: when the model didn't (or couldn't) checkpoint,
     # write the mechanical extract so the rehydrator has something real.
@@ -391,6 +394,7 @@ def main():
                 "session_id": session_id,
                 "trigger": event.get("trigger", ""),
                 "occupancy": occ,
+                "model": model,
                 "ledger_present": ledger_present,
                 "agent": is_agent,
                 "auto_ledger": auto_status,

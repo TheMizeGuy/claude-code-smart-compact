@@ -123,7 +123,7 @@ entries = [
     {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": [{"type": "text", "text": "{\"retrievedItem\": {\"chunk\": {\"memoryId\": \"019f4200-0000-7000-0000-0000deadbeef\", \"relevanceScore\": 0.7}}}"}]}]}},
     {"type": "assistant", "isSidechain": True, "message": {"content": [{"type": "text", "text": "sidechain text must not win"}]}},
     {"type": "assistant", "message": {"content": [{"type": "text", "text": "final assistant status: gamma fixed"}]}},
-    {"type": "assistant", "message": {"usage": {"input_tokens": 2000, "output_tokens": 400, "cache_read_input_tokens": 300000, "cache_creation_input_tokens": 500}}},
+    {"type": "assistant", "message": {"model": "claude-fable-5", "usage": {"input_tokens": 2000, "output_tokens": 400, "cache_read_input_tokens": 300000, "cache_creation_input_tokens": 500}}},
 ]
 with open(sys.argv[1], "w") as f:
     for e in entries:
@@ -146,6 +146,9 @@ grep -q "sidechain text must not win" "$AL" && bad "sidechain text leaked" || ok
 grep -q "occupancy: 302900" "$AL" && ok "occupancy recorded in header" || bad "occupancy missing"
 grep -q "compact boundary" "$AL" && ok "earlier-boundary note present" || bad "boundary note missing"
 tail -1 "$COMPACT_EVENTS_LOG" | grep -q '"auto_ledger": "written"' && ok "auto_ledger=written logged" || bad "auto_ledger status missing"
+# v5 (2026-07-17): the flight line carries the session's model (from the same
+# assistant entry the occupancy came from) — per-model regime diagnostics.
+tail -1 "$COMPACT_EVENTS_LOG" | grep -q '"model": "claude-fable-5"' && ok "model recorded in flight line" || bad "model missing from flight line"
 grep -q "This session is being continued" "$AL" && bad "continuation-summary blob leaked into users" || ok "continuation-summary blob excluded"
 grep -q "019f4200-0000-7000-0000-00000000cea7" "$AL" && ok "goodmem CREATE id captured as a write" || bad "create memoryId missing"
 grep -q "019f4200-0000-7000-0000-0000deadbeef" "$AL" && bad "goodmem RETRIEVE id wrongly listed as a write" || ok "retrieve memoryId excluded from writes"

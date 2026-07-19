@@ -59,9 +59,9 @@ machine without step 2 they fail, they don't skip. Expected:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `test-watermark.sh` | 42 | ceiling estimator, tier thresholds, ratio band, re-arm, fallbacks |
-| `test-compact-hooks.sh` | 69 | auto-ledger extraction, rehydration lattice, 16KB cap, verifier spawn, log rotation, agent guards |
-| `test-self-compact-logic.sh` | 71 | pane-busy/limit-banner parsing, adoption semantics, reset-time folding |
+| `test-watermark.sh` | 47 | ceiling estimator (incl. the low-biased-sample regression and over-window clamp), tier thresholds, ratio band, re-arm, fallbacks |
+| `test-compact-hooks.sh` | 70 | auto-ledger extraction, rehydration lattice, 16KB cap, verifier spawn, log rotation, agent guards, model-tagged flight lines |
+| `test-self-compact-logic.sh` | 91 | pane-busy/limit-banner parsing (incl. per-state esc-hints and timer status lines), queued-send detection, adoption semantics, reset-time folding |
 | `test-self-compact-e2e.sh` | 7 | the real script against a stub tmux: schedule → /compact → limit failure → reset retry → boundary → continuation |
 
 All suites use `mktemp` sandboxes and set `COMPACT_EVENTS_LOG` so they never
@@ -87,9 +87,11 @@ Full design and rationale: `docs/ARCHITECTURE.md`.
 - **Watermark**: occupancy is computed from the transcript's latest assistant
   `message.usage`. Tiers fire at 75% (T1: start externalizing), 87% (T2:
   write the ledger NOW, template + exact path injected), and 94% (T3:
-  imminent) of the EFFECTIVE ceiling: the median of the last 5 observed
+  imminent) of the EFFECTIVE ceiling: the max of the last 5 observed
   auto-compact occupancies from the flight log, not the nominal window (the
-  harness fires well below it, and the trigger point moves across builds).
+  harness fires well below it, the trigger point moves across builds, and
+  recorded occupancies only ever understate the real trigger — see
+  `docs/ARCHITECTURE.md` on why max, not median).
 - **Ledger contract**: `<cwd>/.claude/blackboard/<session_id>/LEDGER.md`,
   written by the model when nudged. Goal & acceptance criteria · Now · Done so
   far · Decisions & constraints · Files/symbols touched · Verbatim critical
@@ -124,7 +126,9 @@ All optional; defaults are the tested configuration.
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | `200000` via `--window` (settings env) | Nominal compaction window; estimator fallback anchor (0.85W when <2 flight-log samples) |
 | `COMPACT_EVENTS_LOG` | `~/.claude/logs/compact-events.log` | Flight log path. Tests MUST override it |
 | `COMPACT_VERIFY_DELAY_S` | `600` | Recorder's detached boundary-verifier delay |
-| `SELF_COMPACT_TIMEOUT` | `1800` | Watcher's boundary wait (covers /compact queued behind long Stop-hook turns) |
+| `SELF_COMPACT_TIMEOUT` | `1800` | Watcher's boundary wait when there is no evidence the send queued |
+| `SELF_COMPACT_QUEUED_TIMEOUT` | `14400` | Boundary wait once the transcript PROVES the /compact enqueued mid-turn (queued messages flush only at the real turn end, which Stop hooks can push out for hours) |
+| `SELF_COMPACT_FLUSH_AFTER` | `30` | Zero execution evidence this long after the send → one bare-Enter flush (swallowed-Enter recovery) |
 | `SELF_COMPACT_IDLE_TIMEOUT` / `SELF_COMPACT_IDLE_S` | script defaults | Phase-1 turn-end wait / quiescence window |
 | `SELF_COMPACT_LIMIT_WAIT_MAX` | 6h | Max parseable usage-limit reset the watcher will wait out |
 | `SELF_COMPACT_LIMIT_RETRIES` | `1` | /compact resends after a limit-failure reset |
